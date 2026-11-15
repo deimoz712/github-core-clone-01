@@ -110,6 +110,34 @@ function parseJsonBody(body: Buffer): Record<string, unknown> | undefined {
   }
 }
 
+/**
+ * GraphQL bodies only: one operation object, or a JSON array of them
+ * (GitHub's operation batching). Everything else is a 400, exactly like
+ * parseJsonBody — this allowance must never leak to the REST routes
+ * (protocol.malformed-body-400).
+ */
+function parseGraphqlBody(body: Buffer): Record<string, unknown> | Array<Record<string, unknown>> {
+  if (body.length === 0) throw new HttpError(400, 'Request body must be a JSON object');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'Malformed JSON body');
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new HttpError(400, 'Request body must be a JSON object');
+  }
+  if (Array.isArray(parsed)) {
+    for (const entry of parsed) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        throw new HttpError(400, 'Request body must be a JSON object');
+      }
+    }
+    return parsed as Array<Record<string, unknown>>;
+  }
+  return parsed as Record<string, unknown>;
+}
+
 function pathSegments(pathname: string): string[] {
   return pathname
     .split('/')
@@ -234,7 +262,8 @@ export function createApp(): Server {
           return;
         }
         try {
-          handleGraphql(parseJsonBody(await readBody(req)));
+          const answer = handleGraphql(parseGraphqlBody(await readBody(req)), store);
+          sendJson(res, answer.status, answer.json);
         } catch (err) {
           if (err instanceof HttpError) sendError(res, err.status, err.message);
           else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
@@ -247,8 +276,19 @@ export function createApp(): Server {
           sendError(res, 401, 'Bad credentials');
           return;
         }
+        const raw = await readBody(req);
+        let parsed: unknown;
         try {
-          handleMcp(parseJsonBody(await readBody(req)));
+          parsed = JSON.parse(raw.toString('utf8'));
+        } catch {
+          // A body that is not JSON: HTTP 400 + JSON-RPC -32700 (parse error).
+          sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+          return;
+        }
+        try {
+          const answer = handleMcp(parsed, store);
+          if (answer.empty === true) sendEmpty(res, answer.status);
+          else sendJson(res, answer.status, answer.json ?? {});
         } catch (err) {
           if (err instanceof HttpError) sendError(res, err.status, err.message);
           else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
