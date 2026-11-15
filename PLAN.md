@@ -256,7 +256,54 @@ lokal trial-0/1/2 sebelum submit berikutnya.
   bersama); VM ini lingkungannya berbeda; angka lokal hanya panduan relatif.
 - Kuota efektif akun (3 vs 5/hari) — baru ketahuan saat submit ke-4 dicoba.
 
-## 10. Checklist Fase 2 (berikutnya)
+## 11. Fase 2 — hasil (2026-11-15 ~08:30–09:45 WIB, commit 8feecd1)
+
+Implementasi inti selesai: `git-objects.ts` (object store, packfile baca
+OFS/REF delta + tulis tanpa delta, reachability, shallow/deepen, merge-base,
+diff tree), `scenario.ts` (generator seed → viewer `adaiversen` id 1000,
+stranger `olgabauer` id 1002 — terverifikasi persis), `store.ts` (repo/issue/PR/
+label/comment + squash merge + konflik 405), `git-http.ts` (pkt-line, iklan v2
++ v0, ls-refs, fetch v2/v0, receive-pack report-status), `rest.ts` (REST v3
+lengkap), `app.ts` (router, auth Bearer = MAKEFUN_SHOP_TOKEN, X-GitHub-
+Request-Id, JSON 400). `graphql.ts`/`mcp.ts` masih stub 404 (Fase 3).
+
+Grade lokal (cara Fase 1, env server.mjs + `node main.ts`):
+- **trial-0: 86/120, working 1** — git 30/30, repos 15/15, issues 15/15,
+  pulls 20/20, protocol 5/5, graphql 1/20 (hanya `unauthenticated` — 401
+  sudah benar), mcp 0/15. Perf **173/200** (push 38 @778,8 ms, clone 40
+  @117,3 ms, read 48 @756,8 ms, write 47 @103,2 ms; p50_us 290.676 vs
+  reference 805.899).
+- **trial-1: 86/120, working 1**, grup sama persis. Perf **169/200**
+  (push 40 @699,5 ms, clone 40 @113,4 ms, read 48 @761,4 ms, write 41
+  @143,5 ms; p50_us 305.092).
+- **Replay: state.json trial-0 dan trial-1 BYTE-IDENTIK**
+  (sha256 a7346559…) — determinisme terpenuhi.
+- Semua 34 kegagalan di kedua run adalah GraphQL (19) + MCP (15) — nol
+  kegagalan di git/repos/issues/pulls/protocol.
+
+Skor lokal saat ini: feature round(600×86/120)=430 + agent 0 + perf ~171
+≈ **601/1000**. Fase 3 (GraphQL 19 + MCP 15) bernilai ~370 poin;
+proyeksi 120/120 → ~970/1000, di atas reference ~900.
+
+Bug yang ditemukan & diperbaiki selama Fase 2 (jangan diulang):
+- Report-status push: baris `unpack ok` tanpa `\n` membuat client membaca
+  `unpackDetail: "okok refs/heads/main"` — semua baris report wajib `\n`.
+- Deepen: have yang juga shallow boundary hanya berarti commit + tree-nya,
+  BUKAN seluruh ancestry — kalau ancestry ikut dianggap held, deepen
+  mengirim 0 objek. Walk harus menembus held shallow boundary.
+- `inflateSync` mengabaikan trailing bytes tapi throw saat truncated —
+  `skipDeflateStream` memakai itu (probe eksponensial + binary search).
+- Env (server.mjs) TIDAK exit sendiri setelah trial — pegang port 8080;
+  runner harus kill env setelah entry exit, kalau tidak trial berikutnya
+  gagal EADDRINUSE dan menulis boot-failure export (0/120).
+- `parseJsonBody` di app.ts menolak JSON array (400) — GraphQL batched
+  operations mengirim array; Fase 3 harus mengizinkan array di /api/graphql.
+
+Sisa untuk Fase 3: baca verbatim GRAPHQL_DOCUMENTS (checks-graphql.ts),
+executor GraphQL (viewer, repository, issue, __type, search, cursor
+pagination, global id, errors[]), MCP (JSON-RPC 2.0 Streamable HTTP,
+6 tool wajib, error -32601/-32602/-32700), lalu perf tuning ringan
+(write t1 41 vs t0 47 — variansi VM, bukan regresi kode).
 
 - [ ] Baca verbatim GRAPHQL_DOCUMENTS + bodies check graphql (checks-graphql.ts ~l.100–320)
 - [ ] Baca pulls-merge-conflict + git fixture GraphQL (configureGraphQLGit)
