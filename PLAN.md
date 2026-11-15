@@ -311,3 +311,69 @@ pagination, global id, errors[]), MCP (JSON-RPC 2.0 Streamable HTTP,
       v2 fetch args, sideband framing persis
 - [ ] Baca rest-client.ts + wire.ts: bentuk JSON yang diharapkan (shape checker)
 - [ ] Implementasi (a) object store + packfile, uji dengan git-client suite lokal
+
+## §12 — Hasil Fase 3 (GraphQL + MCP) — 2026-11-15 ~02:00 WIB
+
+Implementasi (commit c1ab0ab, lalu perbaikan files-connection):
+- `graphql.ts` ditulis ulang (~37 KB): tokenizer + parser recursive-descent
+  untuk subset GraphQL (operasi, variabel, alias, inline list/object/enum,
+  inline fragment, `__type`), executor dengan resolver Query/Mutation,
+  Repository, Issue, IssueConnection, PullRequest, PullRequestChangedFile,
+  User, __Type, payload. Global id = base64url `Kind:payload`, decode
+  divalidasi bentuk kanonik (bukan databaseId/number mentah). Field tak
+  dikenal → HTTP 200 + errors[] `Cannot query field "X" on type "Y".`.
+  Repo tak dikenal → data.repository null tanpa errors. Batched array
+  dijawab berurutan. Cursor = base64url `cursor:<number>`, ASC → number >
+  cursor, DESC → number < cursor. mergeable dihitung non-mutating.
+- `mcp.ts` ditulis ulang (~13 KB): JSON-RPC 2.0 Streamable HTTP.
+  `server/discover` (supportedVersions 2026-07-28, 2025-11-25, 2025-06-18,
+  2025-03-26, 2024-11-05), `initialize` (echo revisi yang diminta bila
+  didukung, else 2025-11-25), `notifications/*` → 202 kosong,
+  `tools/list` (array statis — byte-identik), `tools/call` (unknown tool
+  -32602, argumen wajib hilang -32602, eksekusi via Store = rest-parity,
+  hasil text JSON + structuredContent, gagal = isError:true), `ping`.
+  6 tool wajib: create_repo, get_repo, create_issue, list_issues,
+  create_pull_request, merge_pull_request.
+- `app.ts`: `parseGraphqlBody` mengizinkan objek ATAU array JSON hanya di
+  /api/graphql (REST tetap menolak array — protocol.malformed-body-400
+  tetap lolos). `/mcp`: body bukan JSON → HTTP 400 + -32700.
+
+Bug yang ditemukan & diperbaiki selama Fase 3 (jangan diulang):
+- TS parameter property (`constructor(private readonly tokens)`) DITOLAK
+  Node type-stripping (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX) — deklarasikan
+  field secara eksplisit di body class. Berlaku untuk SEMUA file .ts.
+- `files` PR: resolver awal meneruskan sub-seleksi field `files` (`nodes`)
+  sebagai seleksi changed-file → error `Cannot query field "nodes" on
+  type "PullRequestChangedFile"`. Perbaiki dengan tipe connection sendiri
+  (`PullRequestChangedFileConnection`, field `nodes`) seperti issues/
+  pullRequests — connection selalu di-resolve dua lapis (connection →
+  nodes → item).
+- `/tmp` TIDAK persisten antar exec call di VM ini — harness/skrip runner
+  harus tinggal di ~/workspace (run-trial.sh kini di
+  ~/workspace/makefun/run-trial.sh dan meng-absolut-kan path-nya sendiri).
+- `pkill -f <nama>` membunuh shell exec itu sendiri kalau string-nya ada di
+  command line — bunuh background process via PID (`$!`), bukan pkill.
+
+**Grade lokal Fase 3 (verifikasi independen dari artefak export):**
+| trial | conformance | feature | agent | perf | TOTAL | gagal |
+|---|---|---|---|---|---|---|
+| t0 | 120/120 | 600 | 200 | 182 | **982** | — |
+| t1 | 120/120 | 600 | 200 | 177 | **977** | — |
+| t2 | 120/120 | 600 | 200 | 179 | **979** | — |
+Per grup (ketiga trial identik): git 30/30, repos 15/15, issues 15/15,
+pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15.
+Perf vs T_ref (push 1640.82 ms · clone 266.941 ms · read 2759.715 ms ·
+write 348.965 ms): push ~650–685 ms (41–42), clone ~85–117 ms (40–46),
+read ~570–676 ms (50), write ~86–144 ms (41–50). Variansi write antar
+trial = noise VM (41 vs 50), bukan regresi.
+**Replay: state.json t0/t1/t2 BYTE-IDENTIK (sha256
+a0e98d49854b961230227867235c8615858e006db3763f341ac6154af1445590).**
+Artefak: `~/workspace/makefun/grade-fase3/` (t0/t1/t2 state+perf,
+log env/entry). Repo 588 KB total, 155 KB .ts — jauh di bawah batas
+16 MiB sumber / 8 MiB per file.
+
+Skor lokal 977–982/1000, di atas reference ~900. **Entry LAYAK submit
+sebagai v1** (kuota tertulis 5/hari 10 total; kuota efektif akun mungkin
+3 — submit v1 ini menghabiskan 1 slot; jangan submit ulang tanpa
+perubahan yang terukur lebih baik, karena Force_Last: entri terakhir
+yang dinilai).
