@@ -18,7 +18,7 @@ import { Store } from './store.ts';
 import { handleRest, HttpError, type RestAnswer } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { v2Advertisement, v0Advertisement, handleLsRefs, handleFetch, handleReceivePack, decodePktLines } from './git-http.ts';
+import { v2Advertisement, v0Advertisement, handleLsRefs, handleFetch, handleReceivePack } from './git-http.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 /** The token the env presents; the same value is in this process's environment. */
@@ -82,6 +82,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let single: Buffer | null = null;
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
@@ -89,9 +90,20 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
         req.destroy();
         return;
       }
-      chunks.push(chunk);
+      // Hot path: bodies arrive in one chunk — return it without a copy.
+      if (single === null && chunks.length === 0) single = chunk;
+      else {
+        if (single !== null) {
+          chunks.push(single);
+          single = null;
+        }
+        chunks.push(chunk);
+      }
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (single !== null) resolve(single);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
@@ -138,17 +150,47 @@ function parseGraphqlBody(body: Buffer): Record<string, unknown> | Array<Record<
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * Split a request-target into pathname + query string without `new URL`
+ * (URL parsing costs ~10 µs per request on this hot path). Absolute-form
+ * targets and dot-segments fall back to `new URL` so their behaviour is
+ * unchanged — the suite only sends clean origin-form paths.
+ */
+function splitTarget(rawUrl: string): { pathname: string; search: string } {
+  const q = rawUrl.indexOf('?');
+  const pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+  const search = q < 0 ? '' : rawUrl.slice(q + 1);
+  if (rawUrl.startsWith('http://') || rawUrl.startsWith('https://') || /(?:^|\/)\.\.?(?:\/|$)/.test(pathname)) {
+    const url = new URL(rawUrl, 'http://entry');
+    return { pathname: url.pathname, search: url.search.slice(1) };
+  }
+  return { pathname, search };
+}
+
 function pathSegments(pathname: string): string[] {
   return pathname
     .split('/')
     .filter((segment) => segment !== '')
     .map((segment) => {
+      // decodeURIComponent is a no-op without '%'; skip it on the hot path.
+      if (!segment.includes('%')) return segment;
       try {
         return decodeURIComponent(segment);
       } catch {
         return segment;
       }
     });
+}
+
+/** The first pkt-line's payload as a string, without decoding the whole body. */
+function firstPktLine(body: Buffer): string {
+  if (body.length < 4) throw new Error('truncated pkt-line');
+  const header = body.subarray(0, 4).toString('ascii');
+  if (!/^[0-9a-fA-F]{4}$/.test(header)) throw new Error(`invalid pkt-line length ${JSON.stringify(header)}`);
+  const length = Number.parseInt(header, 16);
+  if (length === 0 || length === 1 || length === 2) return '';
+  if (length < 4 || length > body.length) throw new Error('truncated pkt-line');
+  return body.subarray(4, length).toString('utf8').replace(/\n$/, '');
 }
 
 function answerRest(res: ServerResponse, answer: RestAnswer): void {
@@ -163,10 +205,12 @@ function answerRest(res: ServerResponse, answer: RestAnswer): void {
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      const url = new URL(req.url ?? '/', 'http://entry');
-      const pathname = url.pathname;
+      const { pathname, search } = splitTarget(req.url ?? '/');
       const method = req.method ?? 'GET';
       const segments = pathSegments(pathname);
+      // Query params are parsed lazily: the hot routes never read them.
+      let query: URLSearchParams | null = null;
+      const getQuery = (): URLSearchParams => (query ??= new URLSearchParams(search));
 
       // The env's boot probe: 200 {"ok":true}, no token.
       if (method === 'GET' && pathname === '/healthz') {
@@ -181,7 +225,7 @@ export function createApp(): Server {
         const action = segments.slice(2).join('/');
         const repo = store.getRepo(owner, repoName);
         if (action === 'info/refs') {
-          const service = url.searchParams.get('service');
+          const service = getQuery().get('service');
           if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
             sendError(res, 400, 'Missing service parameter');
             return;
@@ -205,9 +249,7 @@ export function createApp(): Server {
           }
           const body = await readBody(req);
           try {
-            const firstLine = decodePktLines(body)[0];
-            const command =
-              firstLine?.kind === 'data' ? firstLine.payload.toString('utf8').replace(/\n$/, '') : '';
+            const command = firstPktLine(body);
             if (command === 'command=ls-refs') {
               sendBytes(res, 200, 'application/x-git-upload-pack-result', handleLsRefs(repo, body));
             } else if (command === 'command=fetch') {
@@ -248,7 +290,7 @@ export function createApp(): Server {
         }
         const body = method === 'GET' || method === 'HEAD' ? undefined : parseJsonBody(await readBody(req));
         try {
-          answerRest(res, handleRest(method, segments.slice(2), url.searchParams, body, { store, origin: `http://${req.headers.host ?? 'entry'}` }));
+          answerRest(res, handleRest(method, segments.slice(2), getQuery(), body, { store, origin: `http://${req.headers.host ?? 'entry'}` }));
         } catch (err) {
           if (err instanceof HttpError) sendError(res, err.status, err.message);
           else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');

@@ -377,3 +377,64 @@ sebagai v1** (kuota tertulis 5/hari 10 total; kuota efektif akun mungkin
 3 — submit v1 ini menghabiskan 1 slot; jangan submit ulang tanpa
 perubahan yang terukur lebih baik, karena Force_Last: entri terakhir
 yang dinilai).
+
+## §13 — Fase 4: optimasi perf (2026-11-15 ~09:05–09:20 WIB)
+
+Dev score v1 (live trial): rank #1533/2.123, skor 913 = feature 600 + agent
+200 + perf 113, p50_us 671.235. Di atas reference ~900 (+13) tapi jauh dari
+top 60 (941/perf 141/p50 459.822 µs) dan top 20 (945/perf 145/p50 432.708 µs).
+Lokal v1 177–182 (p50 ~253–305k µs) vs produksi 671k µs = rasio ~2,5×.
+Model rasio seragam cocok persis dengan v1: points ≈ 179 − 50·log2(2,5) −
+12,5·Σlog2(t_lokal/T_ref) → 113. Jadi perbaikan lokal memprediksi
+perbaikan produksi lewat rumus yang sama.
+
+Profiling (cpu-prof + microbench + hammer wall/server-CPU per op):
+- `readPack` 863 µs/pack: `skipDeflateStream` melakukan ~45× `inflateSync`
+  per pack 3-objek (probe eksponensial + binary search) + Error/stack-trace
+  di tiap probe yang gagal. `handleReceivePack` ~1035 µs (koreksi: microbench
+  pertama salah karena body tanpa flush → parse gagal → pack tak pernah
+  dibaca; angka 287 µs itu palsu).
+- REST handler murah (handleRest GET issue 3,3 µs; issueJson+stringify
+  3,6 µs) — biaya read/write adalah stack node:http + client undici +
+  transport (~140 µs server CPU dari 238–314 µs wall per GET issue).
+- Push didominasi server (wall 3,38 ms/op, server CPU 1,9 ms/op);
+  read/write/clone punya lantai client yang besar.
+
+Perubahan (commit di bawah):
+1. `git-objects.ts` — `inflateEntry()`: satu `inflateSync(pack, {info:true})`
+   per entry; `engine.bytesWritten` = byte input yang dipakai stream
+   (terverifikasi: prefix yang terpakai meski ada trailing bytes). Fallback
+   ke `skipDeflateStream` lama kalau nilainya hilang/tidak masuk akal.
+   Fuzz 1000 pack (level 0/1/6/9, ukuran 0–100 KB, delta OFS/REF,
+   push-pack realistis): 0 gagal. `readPack` 863 → ~100 µs (8×);
+   `importPack` 914 → 71 µs; `handleReceivePack` ~1035 → ~290 µs murni.
+2. `app.ts` — fast path HTTP: split target manual (tanpa `new URL`,
+   fallback ke `new URL` untuk absolute-form/dot-segment), `pathSegments`
+   tanpa decodeURIComponent bila tanpa '%', query diparse lazy (hanya
+   saat route membacanya), git-upload-pack baca hanya pkt-line pertama
+   (tanpa decode penuh), `readBody` fast path single-chunk (tanpa copy;
+   hati-hati: chunk pertama harus ikut saat ada chunk kedua — sudah
+   diperbaiki). Efek terukur kecil di REST (±noise) tapi nyata di git.
+
+Grade lokal Fase 4 (artefak `~/workspace/makefun/grade-fase4/`):
+| trial | conformance | feature | agent | perf | TOTAL | p50_us |
+|---|---|---|---|---|---|---|
+| t0 | 120/120 | 600 | 200 | 191 | **991** | 225.314 |
+| t1 | 120/120 | 600 | 200 | 185 | **985** | 244.269 |
+| t2 | 120/120 | 600 | 200 | 194 | **994** | 196.070 |
+Per workload t0/t1/t2: push 391/384/317 ms (50 pts ×3 — CAP, dari 41–42),
+clone 95/109/91 ms (44/41/44), read 672/778/658 ms (50/48/50),
+write 103/109/78 ms (47/46/50). **Replay: state.json t0/t1/t2
+BYTE-IDENTIK dengan Fase 3 (sha256 a0e98d49…)** — perilaku tidak berubah.
+Proyeksi produksi (model rasio 2,5×): ~120–136 (tengah ~127) vs v1 = 113.
+Rank ~#100–500, kemungkinan masih di luar top 60 (butuh 141).
+
+Sisa plafon (diukur, bukan dugaan): server CPU per GET issue ~140 µs
+(lantai node:http ~60 µs untuk /healthz), per POST issue ~50 µs, per
+push ~950 µs (POST 750 + advertise 200). Read/write/clone didominasi
+client undici + transport yang tidak bisa diubah dari server. Opsi
+berikutnya yang belum dicoba: server HTTP hand-rolled di atas net.Server
+(raw TCP, ~40 µs/req) — potensi +8–10 poin produksi tapi rewrite
+transport 300–400 baris dengan risiko conformance; JANGAN dikerjakan
+tanpa keputusan eksplisit parent. `writePack` level deflate TIDAK diubah
+(pack clone dibangun 1×/round karena cache — dampak ~nol).

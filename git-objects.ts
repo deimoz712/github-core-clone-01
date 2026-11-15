@@ -337,11 +337,10 @@ export function readPack(
     } else if (!(header.type in CODE_OBJECT_TYPE)) {
       throw new Error(`unknown pack object type ${header.type}`);
     }
-    const inflated = inflateSync(pack.subarray(offset));
-    if (inflated.length !== header.size) throw new Error(`pack object at ${entryOffset} inflated to ${inflated.length} bytes, expected ${header.size}`);
-    entry.data = inflated;
-    // inflateSync ignores trailing bytes, so locate the stream's end separately.
-    offset = skipDeflateStream(pack, offset, header.size);
+    const inflated = inflateEntry(pack, offset, header.size, trailerStart);
+    entry.data = inflated.data;
+    // inflateEntry already located the stream's end; no second scan.
+    offset = inflated.next;
     entries.push(entry);
     byOffset.set(entryOffset, entry);
   }
@@ -387,13 +386,29 @@ export function readPack(
 }
 
 /**
- * Advance `offset` past one deflate stream in `pack`. Node's inflateSync does
- * not report how many input bytes it consumed, but it throws on a truncated
- * stream and ignores trailing bytes: so the stream's end is the smallest
- * prefix that inflates to `expectedSize`. Find it with an exponential probe
- * (each attempt inflates at most twice the stream) and a binary search inside
- * the last interval, so one pack entry costs O(stream) inflate work.
+ * Inflate one pack entry's deflate stream, returning its bytes and the offset
+ * just past the stream. One inflateSync call, not the old probe-then-binary-
+ * search: `inflateSync(..., { info: true })` reports the input bytes the
+ * engine consumed as `engine.bytesWritten` (verified: it is the consumed
+ * prefix even with trailing bytes after the stream). The result is checked
+ * the same way as before — inflated length must equal the header's size —
+ * and when the consumed length is missing or implausible the old
+ * skipDeflateStream search runs instead, so a Node that reports it
+ * differently still parses the pack.
  */
+function inflateEntry(pack: Buffer, offset: number, expectedSize: number, limit: number): { data: Buffer; next: number } {
+  const result = inflateSync(pack.subarray(offset, limit), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine?: { bytesWritten?: unknown };
+  };
+  const data = result.buffer;
+  if (data.length !== expectedSize) throw new Error(`pack object inflated to ${data.length} bytes, expected ${expectedSize}`);
+  const consumed = result.engine?.bytesWritten;
+  if (typeof consumed === 'number' && Number.isInteger(consumed) && consumed > 0 && offset + consumed <= limit) {
+    return { data, next: offset + consumed };
+  }
+  return { data, next: skipDeflateStream(pack, offset, expectedSize) };
+}
 function skipDeflateStream(pack: Buffer, offset: number, expectedSize: number): number {
   const limit = pack.length - 20; // never run into the trailer
   const tryEnd = (end: number): boolean => {
