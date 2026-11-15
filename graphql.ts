@@ -398,6 +398,7 @@ const TYPE_FIELDS: Record<string, string[]> = {
   PullRequest: ['id', 'number', 'state', 'merged', 'headRefName', 'baseRefName', 'mergeable', 'files', 'title', 'body'],
   PullRequestConnection: ['nodes'],
   PullRequestChangedFile: ['path'],
+  PullRequestChangedFileConnection: ['nodes'],
   PageInfo: ['hasNextPage', 'endCursor'],
   Ref: ['name'],
   __Type: ['name', 'fields', 'enumValues'],
@@ -503,6 +504,13 @@ function resolveField(typename: string, source: Source, selection: FieldSelectio
     }
     case 'PullRequest':
       return resolvePullRequestField(source.repo as Repo, source.pr as PullRequest, selection, args, ctx, path);
+    case 'PullRequestChangedFileConnection': {
+      if (selection.name === 'nodes') {
+        const items = (source.items ?? []) as Array<{ path: string }>;
+        return items.map((item) => resolveObject('PullRequestChangedFile', { __typename: 'PullRequestChangedFile', path: item.path } as unknown as Source, selection.selections, ctx, path));
+      }
+      return null;
+    }
     case 'PullRequestChangedFile':
       return (source as unknown as { path: string }).path ?? null;
     case 'PageInfo':
@@ -726,8 +734,8 @@ function resolvePullRequestField(repo: Repo, pr: PullRequest, selection: FieldSe
       const first = typeof args.first === 'number' && Number.isFinite(args.first) ? Math.max(0, Math.floor(args.first)) : undefined;
       let files = repo.pullFiles(pr).map((file) => ({ path: file.filename }));
       if (first !== undefined) files = files.slice(0, first);
-      const nodes = files.map((file) => resolveObject('PullRequestChangedFile', { __typename: 'PullRequestChangedFile', path: file.path } as unknown as Source, selection.selections, ctx, path));
-      return { nodes };
+      const connection: Source = { __typename: 'PullRequestChangedFileConnection', repo, items: files };
+      return resolveObject('PullRequestChangedFileConnection', connection, selection.selections, ctx, path);
     }
     default:
       return null;
