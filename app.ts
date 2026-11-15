@@ -12,8 +12,14 @@
 //
 // Every reply carries X-GitHub-Request-Id (a sequential counter) and, for
 // JSON, content-type application/json. A malformed JSON body is a 400.
+//
+// Transport is the hand-rolled HTTP/1.1 layer in raw-http.ts (net.Server):
+// the handler below receives a fully parsed request and returns a reply,
+// which the transport frames. Routing, auth and bodies are unchanged from
+// the node:http version.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import { createRawServer, type RawHandler, type RawReply, type RawRequest } from './raw-http.ts';
 import { Store } from './store.ts';
 import { handleRest, HttpError, type RestAnswer } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
@@ -23,7 +29,6 @@ import { v2Advertisement, v0Advertisement, handleLsRefs, handleFetch, handleRece
 const JSON_TYPE = 'application/json; charset=utf-8';
 /** The token the env presents; the same value is in this process's environment. */
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
 const store = new Store();
 let requestCounter = 0;
@@ -33,37 +38,44 @@ function nextRequestId(): string {
   return `req-${requestCounter}`;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function sendJson(status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): RawReply {
   const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': nextRequestId(),
-    ...headers,
-  });
-  res.end(text);
+  return {
+    status,
+    headers: {
+      'content-type': JSON_TYPE,
+      'x-github-request-id': nextRequestId(),
+      ...headers,
+    },
+    body: Buffer.from(text, 'utf8'),
+  };
 }
 
-function sendEmpty(res: ServerResponse, status: number, headers: Readonly<Record<string, string>> = {}): void {
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId(), ...headers });
-  res.end();
+function sendEmpty(status: number, headers: Readonly<Record<string, string>> = {}): RawReply {
+  return {
+    status,
+    headers: { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId(), ...headers },
+    body: Buffer.alloc(0),
+  };
 }
 
-function sendBytes(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': body.length,
-    'x-github-request-id': nextRequestId(),
-  });
-  res.end(body);
+function sendBytes(status: number, contentType: string, body: Buffer): RawReply {
+  return {
+    status,
+    headers: {
+      'content-type': contentType,
+      'x-github-request-id': nextRequestId(),
+    },
+    body,
+  };
 }
 
-function sendError(res: ServerResponse, status: number, message: string): void {
-  sendJson(res, status, { message });
+function sendError(status: number, message: string): RawReply {
+  return sendJson(status, { message });
 }
 
 /** The bearer token this request carries, or null. */
-function bearerToken(req: IncomingMessage): string | null {
+function bearerToken(req: RawRequest): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
   const match = /^Bearer (.+)$/.exec(header.trim());
@@ -71,41 +83,11 @@ function bearerToken(req: IncomingMessage): string | null {
 }
 
 /** True when the request's bearer token is the shop token. */
-function authorized(req: IncomingMessage): boolean {
+function authorized(req: RawRequest): boolean {
   const token = bearerToken(req);
   if (token === null || token === '') return false;
   if (SHOP_TOKEN === '') return true; // no token configured: accept any bearer
   return token === SHOP_TOKEN;
-}
-
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let single: Buffer | null = null;
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
-        reject(new HttpError(413, 'Request body too large'));
-        req.destroy();
-        return;
-      }
-      // Hot path: bodies arrive in one chunk — return it without a copy.
-      if (single === null && chunks.length === 0) single = chunk;
-      else {
-        if (single !== null) {
-          chunks.push(single);
-          single = null;
-        }
-        chunks.push(chunk);
-      }
-    });
-    req.on('end', () => {
-      if (single !== null) resolve(single);
-      else resolve(Buffer.concat(chunks));
-    });
-    req.on('error', reject);
-  });
 }
 
 function parseJsonBody(body: Buffer): Record<string, unknown> | undefined {
@@ -193,18 +175,17 @@ function firstPktLine(body: Buffer): string {
   return body.subarray(4, length).toString('utf8').replace(/\n$/, '');
 }
 
-function answerRest(res: ServerResponse, answer: RestAnswer): void {
+function answerRest(answer: RestAnswer): RawReply {
   if (answer.empty === true) {
-    sendEmpty(res, answer.status, answer.headers ?? {});
-    return;
+    return sendEmpty(answer.status, answer.headers ?? {});
   }
-  sendJson(res, answer.status, answer.json ?? {}, answer.headers ?? {});
+  return sendJson(answer.status, answer.json ?? {}, answer.headers ?? {});
 }
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
+  const handle: RawHandler = async (req: RawRequest): Promise<RawReply> => {
+    try {
       const { pathname, search } = splitTarget(req.url ?? '/');
       const method = req.method ?? 'GET';
       const segments = pathSegments(pathname);
@@ -214,8 +195,7 @@ export function createApp(): Server {
 
       // The env's boot probe: 200 {"ok":true}, no token.
       if (method === 'GET' && pathname === '/healthz') {
-        sendJson(res, 200, { ok: true });
-        return;
+        return sendJson(200, { ok: true });
       }
 
       // Git smart HTTP: /<owner>/<repo>.git/{info/refs,git-upload-pack,git-receive-pack}
@@ -227,126 +207,108 @@ export function createApp(): Server {
         if (action === 'info/refs') {
           const service = getQuery().get('service');
           if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-            sendError(res, 400, 'Missing service parameter');
-            return;
+            return sendError(400, 'Missing service parameter');
           }
           if (repo === undefined) {
-            sendError(res, 404, 'Not Found');
-            return;
+            return sendError(404, 'Not Found');
           }
           const protocol = req.headers['git-protocol'] === 'version=2' ? 2 : 0;
           if (service === 'git-upload-pack' && protocol === 2) {
-            sendBytes(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
-          } else {
-            sendBytes(res, 200, `application/x-${service}-advertisement`, v0Advertisement(repo, service));
+            return sendBytes(200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
           }
-          return;
+          return sendBytes(200, `application/x-${service}-advertisement`, v0Advertisement(repo, service));
         }
         if (action === 'git-upload-pack' && method === 'POST') {
           if (repo === undefined) {
-            sendError(res, 404, 'Not Found');
-            return;
+            return sendError(404, 'Not Found');
           }
-          const body = await readBody(req);
+          const body = req.body;
           try {
             const command = firstPktLine(body);
             if (command === 'command=ls-refs') {
-              sendBytes(res, 200, 'application/x-git-upload-pack-result', handleLsRefs(repo, body));
-            } else if (command === 'command=fetch') {
-              sendBytes(res, 200, 'application/x-git-upload-pack-result', handleFetch(repo, body, 2));
-            } else if (command.startsWith('want ')) {
-              // A v0 fetch: want lines, then haves, no command line.
-              sendBytes(res, 200, 'application/x-git-upload-pack-result', handleFetch(repo, body, 0));
-            } else {
-              sendError(res, 400, 'Unknown git-upload-pack command');
+              return sendBytes(200, 'application/x-git-upload-pack-result', handleLsRefs(repo, body));
             }
+            if (command === 'command=fetch') {
+              return sendBytes(200, 'application/x-git-upload-pack-result', handleFetch(repo, body, 2));
+            }
+            if (command.startsWith('want ')) {
+              // A v0 fetch: want lines, then haves, no command line.
+              return sendBytes(200, 'application/x-git-upload-pack-result', handleFetch(repo, body, 0));
+            }
+            return sendError(400, 'Unknown git-upload-pack command');
           } catch (err) {
-            sendError(res, 400, err instanceof Error ? err.message : 'Bad request');
+            return sendError(400, err instanceof Error ? err.message : 'Bad request');
           }
-          return;
         }
         if (action === 'git-receive-pack' && method === 'POST') {
           if (repo === undefined) {
-            sendError(res, 404, 'Not Found');
-            return;
+            return sendError(404, 'Not Found');
           }
-          const body = await readBody(req);
+          const body = req.body;
           try {
-            sendBytes(res, 200, 'application/x-git-receive-pack-result', handleReceivePack(repo, body));
+            return sendBytes(200, 'application/x-git-receive-pack-result', handleReceivePack(repo, body));
           } catch (err) {
-            sendError(res, 400, err instanceof Error ? err.message : 'Bad request');
+            return sendError(400, err instanceof Error ? err.message : 'Bad request');
           }
-          return;
         }
-        sendError(res, 404, 'Not Found');
-        return;
+        return sendError(404, 'Not Found');
       }
 
       // API surfaces: a missing or wrong bearer token is a 401.
       if (segments[0] === 'api' && segments[1] === 'v3') {
         if (!authorized(req)) {
-          sendError(res, 401, 'Bad credentials');
-          return;
+          return sendError(401, 'Bad credentials');
         }
-        const body = method === 'GET' || method === 'HEAD' ? undefined : parseJsonBody(await readBody(req));
+        const body = method === 'GET' || method === 'HEAD' ? undefined : parseJsonBody(req.body);
         try {
-          answerRest(res, handleRest(method, segments.slice(2), getQuery(), body, { store, origin: `http://${req.headers.host ?? 'entry'}` }));
+          return answerRest(handleRest(method, segments.slice(2), getQuery(), body, { store, origin: `http://${req.headers.host ?? 'entry'}` }));
         } catch (err) {
-          if (err instanceof HttpError) sendError(res, err.status, err.message);
-          else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
+          if (err instanceof HttpError) return sendError(err.status, err.message);
+          return sendError(500, err instanceof Error ? err.message : 'Internal Server Error');
         }
-        return;
       }
 
       if (pathname === '/api/graphql' && method === 'POST') {
         if (!authorized(req)) {
-          sendError(res, 401, 'Bad credentials');
-          return;
+          return sendError(401, 'Bad credentials');
         }
         try {
-          const answer = handleGraphql(parseGraphqlBody(await readBody(req)), store);
-          sendJson(res, answer.status, answer.json);
+          const answer = handleGraphql(parseGraphqlBody(req.body), store);
+          return sendJson(answer.status, answer.json);
         } catch (err) {
-          if (err instanceof HttpError) sendError(res, err.status, err.message);
-          else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
+          if (err instanceof HttpError) return sendError(err.status, err.message);
+          return sendError(500, err instanceof Error ? err.message : 'Internal Server Error');
         }
-        return;
       }
 
       if (pathname === '/mcp' && method === 'POST') {
         if (!authorized(req)) {
-          sendError(res, 401, 'Bad credentials');
-          return;
+          return sendError(401, 'Bad credentials');
         }
-        const raw = await readBody(req);
+        const raw = req.body;
         let parsed: unknown;
         try {
           parsed = JSON.parse(raw.toString('utf8'));
         } catch {
           // A body that is not JSON: HTTP 400 + JSON-RPC -32700 (parse error).
-          sendJson(res, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
-          return;
+          return sendJson(400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
         }
         try {
           const answer = handleMcp(parsed, store);
-          if (answer.empty === true) sendEmpty(res, answer.status);
-          else sendJson(res, answer.status, answer.json ?? {});
+          if (answer.empty === true) return sendEmpty(answer.status);
+          return sendJson(answer.status, answer.json ?? {});
         } catch (err) {
-          if (err instanceof HttpError) sendError(res, err.status, err.message);
-          else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
+          if (err instanceof HttpError) return sendError(err.status, err.message);
+          return sendError(500, err instanceof Error ? err.message : 'Internal Server Error');
         }
-        return;
       }
 
       // Everything else, every method: GitHub's 404 body.
-      sendError(res, 404, 'Not Found');
-    })().catch((err: unknown) => {
-      if (!res.headersSent) {
-        if (err instanceof HttpError) sendError(res, err.status, err.message);
-        else sendError(res, 500, err instanceof Error ? err.message : 'Internal Server Error');
-      } else {
-        res.destroy();
-      }
-    });
-  });
+      return sendError(404, 'Not Found');
+    } catch (err) {
+      if (err instanceof HttpError) return sendError(err.status, err.message);
+      return sendError(500, err instanceof Error ? err.message : 'Internal Server Error');
+    }
+  };
+  return createRawServer(handle);
 }
